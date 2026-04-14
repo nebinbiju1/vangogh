@@ -16,14 +16,30 @@ Each fingertip acts as a brush with its own color. Raise or lower fingers to pic
 
 **Wave with all 5 fingers open** to erase the canvas. The canvas stays blank for 5 seconds before you can paint again.
 
+## Try it online
+
+👉 **[nebinbiju1.github.io/vangogh](https://nebinbiju1.github.io/vangogh/)**
+
+No install needed — just open the link in Chrome or Edge, allow camera access, and start painting.
+
 ## Run locally
 
-```bash
-cd vangogh
-python3 -m http.server 8080
-```
+1. Clone the repo
+   ```bash
+   git clone https://github.com/nebinbiju1/vangogh.git
+   cd vangogh
+   ```
 
-Then open [http://localhost:8080](http://localhost:8080) in Chrome or Edge and allow camera access.
+2. Start a local server
+   ```bash
+   python3 -m http.server 8080
+   ```
+
+3. Open [http://localhost:8080](http://localhost:8080) in Chrome or Edge
+
+4. Allow camera access when prompted — that's it, you're ready to paint
+
+> **Note:** The app must be served over HTTP (not opened as a file) because the browser requires a server context to access the webcam.
 
 ## Tech
 
