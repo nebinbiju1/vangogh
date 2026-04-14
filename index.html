@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VanGogh</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; overflow: hidden; }
+    #mainCanvas { position: fixed; inset: 0; width: 100%; height: 100%; cursor: none; }
+
+    #ui {
+      position: fixed; top: 18px; left: 18px;
+      pointer-events: none; user-select: none;
+    }
+    #statusLine {
+      color: rgba(255,255,255,0.35); font: 11px/1 monospace; margin-bottom: 14px;
+    }
+    #palette { display: flex; flex-direction: column; gap: 6px; }
+    .fl {
+      display: flex; align-items: center; gap: 8px;
+      font: 11px/1 monospace; color: rgba(255,255,255,0.5);
+    }
+    .dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+
+    #hint {
+      position: fixed; bottom: 18px; left: 18px;
+      color: rgba(255,255,255,0.22); font: 11px/1 monospace;
+      pointer-events: none;
+    }
+
+    #preview {
+      position: fixed; bottom: 18px; right: 18px;
+      width: 180px; aspect-ratio: 4/3;
+      border-radius: 10px; overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: #080808;
+    }
+    #inputVideo {
+      width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1); display: block;
+    }
+    #handCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+
+<canvas id="mainCanvas"></canvas>
+
+<div id="ui">
+  <div id="statusLine">starting camera…</div>
+  <div id="palette">
+    <div class="fl"><div class="dot" style="background:#FF4466"></div>thumb</div>
+    <div class="fl"><div class="dot" style="background:#FF9900"></div>index</div>
+    <div class="fl"><div class="dot" style="background:#44DD88"></div>middle</div>
+    <div class="fl"><div class="dot" style="background:#44AAFF"></div>ring</div>
+    <div class="fl"><div class="dot" style="background:#CC55FF"></div>pinky</div>
+  </div>
+</div>
+
+<div id="hint">✋ wave with all 5 fingers to erase</div>
+
+<div id="preview">
+  <video id="inputVideo" autoplay playsinline muted></video>
+  <canvas id="handCanvas"></canvas>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+// ─── Setup ────────────────────────────────────────────────
+const mainCanvas = document.getElementById('mainCanvas');
+const ctx        = mainCanvas.getContext('2d');
+const handCanvas = document.getElementById('handCanvas');
+const hctx       = handCanvas.getContext('2d');
+const video      = document.getElementById('inputVideo');
+
+function resize() {
+  mainCanvas.width  = window.innerWidth;
+  mainCanvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Fill background once on init and after erase
+function fillBg() {
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, mainCanvas.width, mainCanvas.height);
+}
+fillBg();
+
+// ─── Finger config ────────────────────────────────────────
+const FINGER_COLORS = ['#FF4466', '#FF9900', '#44DD88', '#44AAFF', '#CC55FF'];
+const FINGER_NAMES  = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+const TIP_IDX       = [4, 8, 12, 16, 20];  // landmark tip indices
+const PIP_IDX       = [2, 6, 10, 14, 18];  // landmark pip/mid indices
+
+const BRUSH_SIZE = 14; // radius in px
+
+// ─── State ────────────────────────────────────────────────
+let landmarks   = null;
+let handPresent = false;
+let palmX = 0.5, palmY = 0.5;
+let prevPalmX = 0.5, prevPalmY = 0.5;
+let velX = 0, velY = 0;
+let fingerCount = 0;
+
+// Previous screen-space tip positions for smooth stroke interpolation
+const prevTip = TIP_IDX.map(() => null); // null or {x, y}
+
+// Erase gesture
+let eraseCooldown = 0;
+let eraseUntil    = 0; // timestamp when canvas becomes active again
+
+// ─── Finger extended detection ────────────────────────────
+function isExtended(lms, i) {
+  if (i === 0) { // thumb: tip far from index MCP laterally
+    return Math.hypot(lms[4].x - lms[5].x, lms[4].y - lms[5].y) > 0.09;
+  }
+  return lms[TIP_IDX[i]].y < lms[PIP_IDX[i]].y;
+}
+
+function countExtended(lms) {
+  let n = 0;
+  for (let i = 0; i < 5; i++) if (isExtended(lms, i)) n++;
+  return n;
+}
+
+// ─── Painting ─────────────────────────────────────────────
+function paintFinger(i, cx, cy) {
+  const prev = prevTip[i];
+  ctx.lineCap    = 'round';
+  ctx.lineJoin   = 'round';
+  ctx.lineWidth  = BRUSH_SIZE * 2;
+  ctx.strokeStyle = FINGER_COLORS[i];
+
+  if (prev) {
+    ctx.beginPath();
+    ctx.moveTo(prev.x, prev.y);
+    ctx.lineTo(cx, cy);
+    ctx.stroke();
+  } else {
+    // First frame of this finger: just a dot
+    ctx.beginPath();
+    ctx.arc(cx, cy, BRUSH_SIZE, 0, Math.PI * 2);
+    ctx.fillStyle = FINGER_COLORS[i];
+    ctx.fill();
+  }
+
+  prevTip[i] = { x: cx, y: cy };
+}
+
+// ─── Erase ────────────────────────────────────────────────
+function triggerErase() {
+  fillBg();
+  eraseUntil    = Date.now() + 5000;
+  eraseCooldown = 80;
+}
+
+// ─── Render loop ─────────────────────────────────────────
+function render() {
+  requestAnimationFrame(render);
+
+  const W = mainCanvas.width, H = mainCanvas.height;
+
+  if (eraseCooldown > 0) eraseCooldown--;
+
+  // Canvas inactive for 5s after erase
+  if (Date.now() < eraseUntil) return;
+
+  if (!handPresent || !landmarks) return;
+
+  const speed = Math.hypot(velX, velY);
+
+  // Check erase gesture: all fingers open + fast wave
+  if (eraseCooldown === 0 && fingerCount >= 4 && speed > 22) {
+    triggerErase();
+    for (let i = 0; i < 5; i++) prevTip[i] = null; // reset strokes
+    return;
+  }
+
+  // Paint each extended finger
+  for (let i = 0; i < 5; i++) {
+    if (isExtended(landmarks, i)) {
+      const lm = landmarks[TIP_IDX[i]];
+      // Mirror x to match the mirrored preview feel
+      const cx = (1 - lm.x) * W;
+      const cy = lm.y * H;
+      paintFinger(i, cx, cy);
+    } else {
+      prevTip[i] = null; // finger down → break stroke continuity
+    }
+  }
+}
+
+// ─── Hand skeleton in preview ─────────────────────────────
+const CONNECTIONS = [
+  // [from, to, finger-index for color (-1 = palm)]
+  [0,1,-1],[1,2,0],[2,3,0],[3,4,0],       // thumb
+  [0,5,-1],[5,6,1],[6,7,1],[7,8,1],       // index
+  [5,9,-1],[9,10,2],[10,11,2],[11,12,2],  // middle
+  [9,13,-1],[13,14,3],[14,15,3],[15,16,3],// ring
+  [13,17,-1],[17,18,4],[18,19,4],[19,20,4],// pinky
+  [0,17,-1]
+];
+
+function drawSkeleton(lms) {
+  const w = handCanvas.offsetWidth, h = handCanvas.offsetHeight;
+  handCanvas.width = w; handCanvas.height = h;
+  hctx.clearRect(0, 0, w, h);
+  hctx.lineWidth = 1.8;
+
+  for (const [a, b, fi] of CONNECTIONS) {
+    hctx.strokeStyle = fi >= 0
+      ? FINGER_COLORS[fi].replace(')', ',0.75)').replace('rgb', 'rgba').replace('#', '')
+      : 'rgba(255,255,255,0.3)';
+
+    // Use hex color directly with alpha via globalAlpha
+    hctx.globalAlpha = fi >= 0 ? 0.8 : 0.3;
+    hctx.strokeStyle = fi >= 0 ? FINGER_COLORS[fi] : '#ffffff';
+    hctx.beginPath();
+    hctx.moveTo((1 - lms[a].x) * w, lms[a].y * h);
+    hctx.lineTo((1 - lms[b].x) * w, lms[b].y * h);
+    hctx.stroke();
+  }
+
+  hctx.globalAlpha = 1;
+  for (let i = 0; i < 5; i++) {
+    const lm = lms[TIP_IDX[i]];
+    const extended = isExtended(lms, i);
+    hctx.beginPath();
+    hctx.arc((1 - lm.x) * w, lm.y * h, extended ? 4 : 2.5, 0, Math.PI * 2);
+    hctx.fillStyle = FINGER_COLORS[i];
+    hctx.globalAlpha = extended ? 1 : 0.4;
+    hctx.fill();
+  }
+  hctx.globalAlpha = 1;
+}
+
+// ─── MediaPipe ────────────────────────────────────────────
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.72,
+  minTrackingConfidence: 0.55
+});
+
+hands.onResults(results => {
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    const lms = results.multiHandLandmarks[0];
+    landmarks   = lms;
+    handPresent = true;
+
+    prevPalmX = palmX; prevPalmY = palmY;
+    palmX = lms[0].x; palmY = lms[0].y;
+
+    velX = velX * 0.6 + (palmX - prevPalmX) * mainCanvas.width  * 0.4;
+    velY = velY * 0.6 + (palmY - prevPalmY) * mainCanvas.height * 0.4;
+
+    fingerCount = countExtended(lms);
+    drawSkeleton(lms);
+
+    document.getElementById('statusLine').textContent =
+      fingerCount === 0 ? 'fist — no brush' : `${fingerCount} finger${fingerCount > 1 ? 's' : ''} painting`;
+  } else {
+    handPresent = false;
+    landmarks   = null;
+    for (let i = 0; i < 5; i++) prevTip[i] = null;
+    velX *= 0.85; velY *= 0.85;
+    hctx.clearRect(0, 0, handCanvas.width, handCanvas.height);
+    document.getElementById('statusLine').textContent = 'show your hand';
+  }
+});
+
+// ─── Camera ───────────────────────────────────────────────
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 640, height: 480
+});
+
+camera.start()
+  .then(() => { document.getElementById('statusLine').textContent = 'show your hand'; })
+  .catch(err => { document.getElementById('statusLine').textContent = `camera error: ${err.message}`; });
+
+render();
+</script>
+</body>
+</html>
